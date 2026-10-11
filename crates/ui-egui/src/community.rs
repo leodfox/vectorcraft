@@ -33,7 +33,7 @@ pub fn discord_button(app: &mut VectorcraftApp, ui: &mut Ui, large: bool) -> egu
     let ir = egui::Rect::from_center_size(r.left_center() + vec2(h * 0.35 + icon / 2.0, 0.0), vec2(icon, icon));
     icons::paint(ui, "message-circle", ir, Color32::WHITE);
     ui.painter().galley(egui::pos2(ir.right() + h * 0.2, r.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
-    let resp = resp.on_hover_text(tl!("Join the ArtCraft community on Discord (discord.gg/artcraft)"));
+    let resp = resp.on_hover_text(tl!("Join the Ardoise community on Discord (discord.gg/artcraft)"));
     if resp.clicked() {
         app.open_link("help.discord");
     }
@@ -52,16 +52,9 @@ fn link(app: &mut VectorcraftApp, ui: &mut Ui, icon: &str, label: &str, cmd: &st
     });
 }
 
-/// The Discord button and the website / app page / GitHub links.
-pub fn links(app: &mut VectorcraftApp, ui: &mut Ui) {
-    discord_button(app, ui, true);
-    ui.add_space(8.0);
-    let l = app.session.execute("help.links", &serde_json::json!({})).unwrap_or_default();
-    let s = |k: &str| l[k].as_str().unwrap_or("").to_string();
-    link(app, ui, "globe", tl!("ArtCraft website"), "help.website", &s("website"));
-    link(app, ui, "external-link", tl!("VectorCraft on getartcraft.com"), "help.appPage", &s("appPage"));
-    link(app, ui, "git-branch", tl!("Source code on GitHub"), "help.github", &s("github"));
-}
+/// Ardoise ships no community or upstream links: kept as a no-op so the About dialog and Home
+/// layouts stay unchanged.
+pub fn links(_app: &mut VectorcraftApp, _ui: &mut Ui) {}
 
 #[cfg(test)]
 mod tests {

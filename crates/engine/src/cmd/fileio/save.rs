@@ -278,7 +278,7 @@ fn doc_to_save(st: &DocState, f: &Format) -> Arc<Document> {
 fn fidelity_warning(f: &Format) -> Option<String> {
     (!is_native(f)).then(|| {
         format!(
-            "{} keeps the artwork but not everything a VectorCraft document holds (editable effects, symbols, swatches, styles): save as VectorCraft to keep it all editable",
+            "{} keeps the artwork but not everything a Ardoise Vecteur document holds (editable effects, symbols, swatches, styles): save as Ardoise Vecteur to keep it all editable",
             f.label
         )
     })
@@ -351,7 +351,7 @@ fn blank_pages(doc: &Document) -> Document {
 }
 
 /// Why a `.ai` file saved without PDF content looks empty elsewhere.
-const NOT_PDF_COMPATIBLE: &str = "saved without PDF content: VectorCraft opens it as before, other apps show empty pages";
+const NOT_PDF_COMPATIBLE: &str = "saved without PDF content: Ardoise Vecteur opens it as before, other apps show empty pages";
 
 /// The encoder's params for a `.ai` file, from a save's or an export's: a PDF of every artboard
 /// with the PDF options, always carrying the native document, its layers and sublayers PDF layers

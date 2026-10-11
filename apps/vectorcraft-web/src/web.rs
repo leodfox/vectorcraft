@@ -77,6 +77,7 @@ pub fn start() {
             restarts: 0,
         };
         track_paste(&host.pasted);
+        install_bridge(host.inbox.clone(), host.pasted.clone());
         run(host, canvas, None).await;
     });
 }
@@ -111,6 +112,9 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
                     rs.device.set_device_lost_callback(move |reason, msg| loss.report(&ctx, format!("{reason:?}: {msg}")));
                 }
                 host.pasted.borrow_mut().ctx = Some(ctx.clone());
+                if kept.is_none() {
+                    post_ready();
+                }
                 let services = services(host.inbox.clone(), host.place_inbox.clone(), ctx.clone(), host.locks.clone());
                 let app = match taken.borrow_mut().take() {
                     Some(mut app) => {
@@ -131,7 +135,7 @@ async fn run(host: Host, canvas: web_sys::HtmlCanvasElement, moving: Option<Movi
                 el.remove();
             }
         }
-        (Err(e), None) => notice(&[&format!("VectorCraft failed to start: {}", js_err(e)), "A browser with WebGPU or WebGL2 is required."]),
+        (Err(e), None) => notice(&[&format!("Ardoise Vecteur failed to start: {}", js_err(e)), "A browser with WebGPU or WebGL2 is required."]),
         (Err(e), Some(kept)) => {
             log::error!("vectorcraft-web: couldn't restart the graphics: {}", js_err(e));
             give_up(slot.borrow_mut().take(), kept);
@@ -161,7 +165,7 @@ fn detect_language() {
     }
     i18n::set_system_locales(tags.as_slice());
     if let Some(el) = element(LOADING_ID) {
-        el.set_text_content(Some(i18n::message(i18n::system_lang(), "Loading VectorCraft…").as_str()));
+        el.set_text_content(Some(i18n::message(i18n::system_lang(), "Loading Ardoise Vecteur…").as_str()));
     }
 }
 
@@ -495,6 +499,9 @@ impl RecoveryStore for BrowserStore {
 fn download(path: &str, bytes: &[u8]) -> Result<(), String> {
     let js = |e: wasm_bindgen::JsValue| format!("{e:?}");
     let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "vectorcraft".into());
+    if post_saved(&name, bytes) {
+        return Ok(());
+    }
     let window = web_sys::window().ok_or("no window")?;
     let document = window.document().ok_or("no document")?;
     let url = blob_url(bytes, fileio::format_for_name(&name).map_or("application/octet-stream", |f| f.mime))?;
@@ -572,4 +579,151 @@ fn print_pdf(pdf: &[u8]) -> Result<(), String> {
     frame.set_src(&url);
     document.body().ok_or("no body")?.append_child(&frame).map_err(js_err)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Ardoise host bridge (postMessage). Protocol: see BRIDGE.md in the Ardoise repository.
+//   -> parent  {type:"ready", app}                           once the editor is up
+//   <- editor  {type:"open", name, bytes:ArrayBuffer}         only from window.parent at ?parentOrigin=
+//   -> parent  {type:"saved", app, name, bytes:ArrayBuffer}   native-format save inside an iframe
+// ---------------------------------------------------------------------------------------------
+const ARDOISE_APP: &str = "vector";
+const NATIVE_EXTS: &[&str] = &["vectorcraft"];
+
+/// Files pushed by the host go straight into the shared inbox, like a drag-and-drop.
+type BridgeQueue = Inbox;
+
+/// True when this page is embedded in another window (an iframe).
+fn in_iframe() -> bool {
+    let Some(w) = web_sys::window() else {
+        return false;
+    };
+    match w.parent() {
+        Ok(Some(p)) => !js_sys::Object::is(&p, &w),
+        _ => false,
+    }
+}
+
+fn str_field(obj: &wasm_bindgen::JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(obj, &wasm_bindgen::JsValue::from_str(key)).ok()?.as_string()
+}
+
+/// Accept only `https://host[:port]` or `http://localhost[:port]` (no path, query, fragment or userinfo).
+fn valid_origin(o: &str) -> bool {
+    let (rest, https) = match (o.strip_prefix("https://"), o.strip_prefix("http://")) {
+        (Some(r), _) => (r, true),
+        (None, Some(r)) => (r, false),
+        _ => return false,
+    };
+    if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')) {
+        return false;
+    }
+    let (host, port) = match rest.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    if host.is_empty() || host.starts_with(['.', '-']) || host.ends_with(['.', '-']) || host.contains(':') {
+        return false;
+    }
+    if let Some(p) = port
+        && (p.is_empty() || p.len() > 5 || !p.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    https || host == "localhost"
+}
+
+/// The embedding page's origin, from `?parentOrigin=...`. `None` disables the bridge.
+fn parent_origin() -> Option<String> {
+    let q = query();
+    let raw = q.trim_start_matches('?').split('&').find_map(|kv| kv.strip_prefix("parentOrigin="))?;
+    let decoded: String = js_sys::decode_uri_component(raw).ok()?.into();
+    valid_origin(&decoded).then_some(decoded)
+}
+
+/// Post `msg` to the parent window, addressed to the validated parent origin only (never "*").
+fn post_to_parent(msg: &js_sys::Object) -> Result<(), String> {
+    let origin = parent_origin().ok_or("bridge disabled (no valid parentOrigin)")?;
+    let w = web_sys::window().ok_or("no window")?;
+    let parent = w.parent().map_err(js_err)?.ok_or("no parent window")?;
+    parent.post_message(msg, &origin).map_err(js_err)
+}
+
+fn message(fields: &[(&str, wasm_bindgen::JsValue)]) -> js_sys::Object {
+    let o = js_sys::Object::new();
+    for (k, v) in fields {
+        let _ = js_sys::Reflect::set(&o, &wasm_bindgen::JsValue::from_str(k), v);
+    }
+    o
+}
+
+/// Listen for `open` messages from same-origin senders and announce `ready` to the parent.
+fn install_bridge(queue: BridgeQueue, pasted: Rc<RefCell<Pasted>>) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(parent_origin) = parent_origin() else {
+        log::info!("bridge disabled: no valid parentOrigin in the query string");
+        return;
+    };
+    let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
+        if ev.origin() != parent_origin {
+            return;
+        }
+        let from_parent = match (ev.source(), web_sys::window().and_then(|w| w.parent().ok().flatten())) {
+            (Some(src), Some(par)) => js_sys::Object::is(&src, &par),
+            _ => false,
+        };
+        if !from_parent {
+            return;
+        }
+        let data = ev.data();
+        if str_field(&data, "type").as_deref() != Some("open") {
+            return;
+        }
+        let Ok(bytes) = js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str("bytes")) else {
+            return;
+        };
+        if !(bytes.is_instance_of::<js_sys::ArrayBuffer>() || bytes.is_instance_of::<js_sys::Uint8Array>()) {
+            log::warn!("bridge: open message without ArrayBuffer bytes ignored");
+            return;
+        }
+        let name = str_field(&data, "name").filter(|n| !n.is_empty()).unwrap_or_else(|| "file".into());
+        let bytes = js_sys::Uint8Array::new(&bytes).to_vec();
+        queue.lock().unwrap_or_else(|e| e.into_inner()).push((name, bytes));
+        // Wake the current runner (the context changes when the graphics restart).
+        if let Some(ctx) = &pasted.borrow().ctx {
+            ctx.request_repaint();
+        }
+    });
+    let _ = window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref());
+    on_message.forget();
+}
+
+/// Announce `ready` to the host (once, on the first start; not after a graphics restart).
+fn post_ready() {
+    if in_iframe()
+        && parent_origin().is_some()
+        && let Err(e) = post_to_parent(&message(&[("type", "ready".into()), ("app", ARDOISE_APP.into())]))
+    {
+        log::error!("bridge: ready message failed: {e}");
+    }
+}
+
+/// Native-format save inside an iframe: hand the bytes to the host instead of downloading.
+/// Returns true when the bytes were posted.
+fn post_saved(name: &str, bytes: &[u8]) -> bool {
+    let ext = name.rsplit('.').next().map(str::to_ascii_lowercase).unwrap_or_default();
+    if !in_iframe() || parent_origin().is_none() || !NATIVE_EXTS.contains(&ext.as_str()) {
+        return false;
+    }
+    let buffer = js_sys::Uint8Array::from(bytes).buffer();
+    let msg = message(&[("type", "saved".into()), ("app", ARDOISE_APP.into()), ("name", name.into()), ("bytes", buffer.into())]);
+    match post_to_parent(&msg) {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("bridge: saved message failed ({e}); falling back to download");
+            false
+        }
+    }
 }
